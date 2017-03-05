@@ -19,14 +19,14 @@ class BaseModel:
     Base Level Class for ML Models
     -Base level class that keeps the bare minimum amount of functionality
     -Allows loading/saving model from checkpoints (including optimization parameters)
-    
+
     TODO: Does preserve randomness, i.e the random seeds would be different when restarted (low priority)
     """
-    def __init__(self, params, paramFile=None, reloadFile=None, 
+    def __init__(self, params, paramFile=None, reloadFile=None,
             additional_attrs = {},
-            dataset_train = np.array([0]), 
-            dataset_valid= np.array([0]), 
-            dataset_test = np.array([0]), 
+            dataset_train = np.array([0]),
+            dataset_valid= np.array([0]),
+            dataset_test = np.array([0]),
             dataset = np.array([0])):
         """
         MLModel
@@ -66,6 +66,15 @@ class BaseModel:
             if (k in params and k not in self.params) or self.params[k]!=params[k]:
                 print 'Adding/Modifying loaded parameters: ',k,' to ',params[k]
                 self.params[k]= params[k]
+
+        if self._stateful:
+            # initStates and tStates are populated during construction. They're
+            # chosen deterministically, and don't get updated, so they dont't
+            # have to be saved anywhere.
+            self.initStates = {}
+            self.tStates = {}
+            self.stateUpdates = []
+
         self._countParams()
         if self.params['optimizer']=='adam':
             self.optimizer = adam
@@ -110,6 +119,10 @@ class BaseModel:
         print toPrint
         if logThis and hasattr(self,'logf'):
             self.logf.write(toPrint+'\n')
+
+    @property
+    def _stateful(self):
+        return self.params.get('stateful', False)
 
     def _openLogFile():
         assert 'logfile' in self.params,'Requires location of logfile'
@@ -209,6 +222,40 @@ class BaseModel:
         else:
             self.updates.append((var,data))
 
+    def _addState(self, name, init_state, **kwargs):
+        """
+        Add to state set. State values are similar to weights, but can be reset
+        between runs.
+        """
+        if not self._stateful:
+            # this is not necessarily a show-stopper; we might want to train a
+            # non-stateful model, then evaluate on a stateful model.
+            warnings.warn("Adding state " + name + " to non-stateful model")
+        if name not in self.initStates:
+            self.initStates[name] = init_state.astype(config.floatX)
+            self.tStates[name] = theano.shared(self.initStates[name],
+                                               name=name, borrow=False,
+                                               **kwargs)
+        else:
+            warnings.warn(name+" found in initStates. No action taken")
+
+    def _addStateUpdate(self, svar, new_val):
+        """
+        Adds an update to a state variable.
+        """
+        if svar in [n for n, _ in self.stateUpdates]:
+            warnings.warn(svar.name+' found in self.stateUpdates...no action taken')
+        else:
+            self.stateUpdates.append((svar, new_val))
+
+    def resetStates(self):
+        """
+        Reset states to their initial values.
+        """
+        for name, init_val in self.initStates.iteritems():
+            t_val = self.tStates[name]
+            t_val.set_value(init_val, borrow=False)
+
 
     def _getModelParams(self, restrict = ''):
         """
@@ -226,14 +273,14 @@ class BaseModel:
         self._p('Modifying : ['+','.join(namelist)+']')
         return paramlist
     
-    def _makeTheanoShared(self, dictIn):
+    def _makeTheanoShared(self, dictIn, borrow=True):
         """
         _makeTheanoShared:  return an Ordered dictionary with the same keys as "dictIn" 
                         except with elements initialized to theano shared variables
         """
         tWeights = OrderedDict()
         for kk, pp in dictIn.items():
-            tWeights[kk] = theano.shared(dictIn[kk], name=kk, borrow=True)
+            tWeights[kk] = theano.shared(dictIn[kk], name=kk, borrow=borrow)
         return tWeights
     
     
@@ -534,12 +581,13 @@ class BaseModel:
     """
                                  Implementation of LSTMs
     """
-    def _LSTMlayer(self, inp, suffix, dropout_prob=0., RNN_SIZE = None):
+    def _LSTMlayer(self, inp, suffix, dropout_prob=0., RNN_SIZE = None, state_id=''):
         """
         LSTM layer that takes as input inp [bs x T x dim] and returns the result of running an LSTM on it
         Input: inp [bs x T x dim]
                suffix [l/r]
                dropout applied at output of LSTM
+               ID to disambiguate multiple LSTMs
         Output of LSTM:hid [T  x bsx dim]
  
         This function expects the following to be defined:
@@ -554,14 +602,15 @@ class BaseModel:
         assert suffix=='r' or suffix=='l' or suffix=='p_l','Invalid suffix: '+suffix
         doBackwards = False
         if suffix=='r':
-            doBackwards = True 
+            assert not self._stateful, "stateful LSTM makes no sense for bidi RNN"
+            doBackwards = True
         #Get Slice
         def _slice(mat, n, dim):
             if mat.ndim == 3:
                 return mat[:, :, n * dim:(n + 1) * dim]
             return mat[:, n * dim:(n + 1) * dim]
         ###### LSTM
-        def _1layer(x_,  h_, c_, lstm_U):
+        def stepfxn(x_,  h_, c_, lstm_U):
             preact = T.dot(h_, lstm_U)
             preact += x_
             i = T.nnet.sigmoid(_slice(preact, 0, RNN_SIZE))
@@ -572,30 +621,48 @@ class BaseModel:
             h = o * T.tanh(c)
             return h, c
         assert self.params['rnn_layers']==1,'Only 1/2 layer LSTM supported'
-        inp_swapped= inp.swapaxes(0,1)
+        inp_swapped = inp.swapaxes(0,1)
         #Perform the single matrix multiply for all the inputs across time
-        lstm_embed = T.dot(inp_swapped,self.tWeights['W_lstm_'+suffix+'_0'])+ self.tWeights['b_lstm_'+suffix+'_0']
-        nsteps     = lstm_embed.shape[0]
-        n_samples  = lstm_embed.shape[1]
-        stepfxn    = _1layer
-        o_info     =[T.alloc(np.asarray(0.,dtype=config.floatX), n_samples, RNN_SIZE),
-                T.alloc(np.asarray(1.,dtype=config.floatX), n_samples, RNN_SIZE) ]
-        n_seq      =[self.tWeights['U_lstm_'+suffix+'_0']]
+        lstm_embed  = T.dot(inp_swapped,self.tWeights['W_lstm_'+suffix+'_0'])+ self.tWeights['b_lstm_'+suffix+'_0']
+        nsteps      = lstm_embed.shape[0]
+        n_samples   = lstm_embed.shape[1]
+        if self._stateful:
+            try:
+                n_samples = self.params['batch_size']
+            except KeyError:
+                raise ValueError('stateful LSTM needs fixed batch_size param')
+            h0 = np.full((n_samples, RNN_SIZE), 0., dtype=config.floatX)
+            h0_name = 'S_h0_lstm_' + suffix + '_' + state_id
+            self._addState(h0_name, h0)
+            h0t = self.tStates[h0_name]
+            c0 = np.full((n_samples, RNN_SIZE), 1., dtype=config.floatX)
+            c0_name = 'S_c0_lstm_' + suffix + '_' + state_id
+            self._addState(c0_name, c0)
+            c0t = self.tStates[c0_name]
+            o_info = [h0t, c0t]
+        else:
+            o_info      = [T.alloc(np.asarray(0.,dtype=config.floatX), n_samples, RNN_SIZE),
+                           T.alloc(np.asarray(1.,dtype=config.floatX), n_samples, RNN_SIZE) ]
+        n_seq       = [self.tWeights['U_lstm_'+suffix+'_0']]
 
         lstm_input = lstm_embed
         #Reverse the input
         if doBackwards:
             lstm_input = lstm_input[::-1]
-        rval, _= theano.scan(stepfxn, 
-                              sequences=[lstm_input],
-                              outputs_info=o_info,
-                              non_sequences = n_seq,
-                              name='LSTM_'+suffix, 
-                              n_steps=nsteps)
+        rval, _= theano.scan(stepfxn,
+                             sequences=[lstm_input],
+                             outputs_info=o_info,
+                             non_sequences = n_seq,
+                             name='LSTM_'+suffix,
+                             n_steps=nsteps)
+        seq_h, seq_c = rval
+        if self._stateful:
+            self._addStateUpdate(h0t, seq_h[-1])
+            self._addStateUpdate(c0t, seq_c[-1])
         #set the output
-        lstm_output =  rval[0]
+        lstm_output =  seq_h
         #Reverse the output
-        if doBackwards: 
+        if doBackwards:
             lstm_output = lstm_output[::-1]
         return self._dropout(lstm_output, dropout_prob)
     
@@ -610,4 +677,3 @@ class BaseModel:
         mat_max = T.max(mat, axis=axis, keepdims=True)
         lse = T.log(T.sum(T.exp(mat - mat_max), axis=axis, keepdims=True)) + mat_max
         return lse
-

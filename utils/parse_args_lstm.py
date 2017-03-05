@@ -39,6 +39,7 @@ parser.add_argument('-params','--paramFile', action='store',default = './NOSUCHF
 parser.add_argument('-sfreq','--savefreq', action='store',default = 50, help='Frequency of saving',type=int)
 
 parser.add_argument('-vonly','--validate_only', action='store_true', help='Only build fxn for validation')
+parser.add_argument('-sf', '--stateful', default=False, action='store_true', help='Make LSTM stateful')
 params = vars(parser.parse_args())
 
 hmap       = OrderedDict() 

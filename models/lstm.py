@@ -23,7 +23,10 @@ class LSTM(BaseModel, object):
         assert self.params['nonlinearity']!='maxout','No support for maxout units in LSTM'
     def _fakeData(self):
         T = 3
-        N = 2
+        if self._stateful:
+            N = self.params['batch_size']
+        else:
+            N = 2
         mask = np.random.random((N,T)).astype(config.floatX)
         small = mask<0.5
         large = mask>=0.5
@@ -49,13 +52,13 @@ class LSTM(BaseModel, object):
         npWeights['b_output'] = self._getWeight((self.params['dim_observations'],))
         return npWeights
     
-    def _setupLSTM(self, X, dropout_prob = 0.):
+    def _setupLSTM(self, X, dropout_prob = 0., state_id=''):
         """
                                         Setup LSTM RNN 
         """
         #X_embed      = self._BNlayer(self.tWeights['W_input'],self.tWeights['b_input'],X,validation=dropout_prob==0.)
         X_embed      = self._LinearNL(self.tWeights['W_input'],self.tWeights['b_input'],X)
-        lstm_output  = self._LSTMlayer(X_embed, 'l', dropout_prob = dropout_prob)
+        lstm_output  = self._LSTMlayer(X_embed, 'l', dropout_prob = dropout_prob, state_id=state_id)
         lstm_output  = lstm_output.swapaxes(0,1)
         params_embed = T.dot(lstm_output, self.tWeights['W_output'])+self.tWeights['b_output']
         output_params= T.nnet.sigmoid(params_embed)
@@ -72,8 +75,8 @@ class LSTM(BaseModel, object):
         #Pad with start token
         input_X       = T.concatenate([T.alloc(np.asarray(0., dtype=config.floatX),X.shape[0],1,X.shape[2]), 
                                  X[:,:-1,:]],axis=1)
-        output_params_t = self._setupLSTM(input_X, dropout_prob = self.params['rnn_dropout'])
-        output_params_e = self._setupLSTM(input_X, dropout_prob = 0.)
+        output_params_t = self._setupLSTM(input_X, dropout_prob = self.params['rnn_dropout'], state_id='t')
+        output_params_e = self._setupLSTM(input_X, dropout_prob = 0., state_id='e')
         
         nll_t         = (T.nnet.binary_crossentropy(output_params_t, X).sum(2)*M).sum()
         nll_e         = (T.nnet.binary_crossentropy(output_params_e, X).sum(2)*M).sum()
@@ -93,11 +96,21 @@ class LSTM(BaseModel, object):
             self.updates_ack= True
             self._p('Added '+str(len(self.updates))+' updates')
             optimizer_up+=self.updates
+            if self._stateful:
+                optimizer_up+=self.stateUpdates
              
-            self.train      = theano.function([X, M], nll_t, updates = optimizer_up)
+            self.train      = theano.function([X, M], nll_t, updates=optimizer_up)
             self.train_debug= theano.function([X, M],[nll_t,norm_list[0],norm_list[1],norm_list[2]],updates = optimizer_up)
-        self.evaluate   = theano.function([X, M],nll_e)
-        
+        self.evaluate   = theano.function([X, M],nll_e,updates=self.stateUpdates if self._stateful else [])
+
+
+    @staticmethod
+    def _padrows(x, rows):
+        if len(x) >= rows:
+            return x
+        to_pad = np.zeros((rows - len(x),) + x.shape[1:], dtype=x.dtype)
+        return np.concatenate((x, to_pad), axis=0)
+
         
     def learn(self, dataset, mask, epoch_start=0, epoch_end=1000, batch_size=200, shuffle=False,
              savefreq=None, savefile = None, dataset_eval = None, mask_eval = None):
@@ -119,7 +132,11 @@ class LSTM(BaseModel, object):
             for bnum,st_idx in enumerate(range(0,N,batch_size)):
                 end_idx = min(st_idx+batch_size, N)
                 X       = dataset[idxlist[st_idx:end_idx],:,:].astype(config.floatX)
+                X = self._padrows(X, batch_size)
                 M       = mask[idxlist[st_idx:end_idx],:].astype(config.floatX)
+                M = self._padrows(M, batch_size)
+                if self._stateful:
+                    self.resetStates()
                 batch_nll = self.train(X=X, M=M)
                 nll  += batch_nll
                 self._p(('Bnum:%d, Batch Bound: %.4f')%(bnum,batch_nll/float(M.sum()))) 
@@ -154,7 +171,9 @@ class LSTM(BaseModel, object):
             end_idx = min(st_idx+batch_size, N)
             X       = dataset[st_idx:end_idx,:,:].astype(config.floatX)
             M       = mask[st_idx:end_idx,:].astype(config.floatX)
-            batch_nll = self.evaluate(X=X, M=M)
+            if self._stateful:
+                self.resetStates()
+            batch_nll = self.evaluate(X=self._padrows(X, batch_size), M=self._padrows(M, batch_size))
             nll  += batch_nll
             self._p(('\tBnum:%d, Batch Bound: %.4f')%(bnum,batch_nll/float(M.sum()))) 
         nll /= float(mask.sum())
